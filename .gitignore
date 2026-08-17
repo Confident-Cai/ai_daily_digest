@@ -1,0 +1,10 @@
+# 配置文件含邮箱授权码/API Key，禁止推送到公开仓库
+config.py
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 环境/密钥
+.env
+*.key
