@@ -15,6 +15,7 @@ import argparse
 import json
 import smtplib
 import time
+import warnings
 from datetime import datetime
 from email.header import Header
 from email.mime.text import MIMEText
@@ -24,6 +25,12 @@ import requests
 from bs4 import BeautifulSoup
 
 import config
+
+# 抓取公开资讯网站时关闭证书验证（个人项目通用做法，避免本地缺CA证书导致失败）
+# 如需严格验证，把这里改成 True 并确保系统证书库完整
+requests.packages.urllib3.disable_warnings(
+    requests.packages.urllib3.exceptions.InsecureRequestWarning)
+SSL_VERIFY = False
 
 # ============================================================
 # 一、数据源抓取（每个源独立 try/except，一个挂了不影响其他）
@@ -35,7 +42,8 @@ HEADERS = {"User-Agent": config.USER_AGENT}
 def _safe_get(url):
     """带超时和UA的GET请求，失败返回None"""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=config.TIMEOUT)
+        resp = requests.get(url, headers=HEADERS, timeout=config.TIMEOUT,
+                            verify=SSL_VERIFY)
         resp.encoding = resp.apparent_encoding or "utf-8"
         return resp
     except Exception as e:
@@ -187,12 +195,20 @@ def summarize(items):
                 "model": config.DEEPSEEK_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.7,
-                "max_tokens": 2000,
+                "max_tokens": 4000,  # 思考型模型的 reasoning_content 会占用配额，需给足
             },
             timeout=120,
+            verify=SSL_VERIFY,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        content = resp.json()["choices"][0]["message"].get("content") or ""
+        content = content.strip()
+        if not content:
+            # 思考型模型可能把 token 全用在推理上导致 content 为空，降级兜底
+            print("[警告] DeepSeek 返回内容为空（可能推理占用过多token），降级为原始列表")
+            lines = [f"- [{s}] {t}\n  {u}" for s, t, u in items]
+            return "（DeepSeek 返回为空，降级为原始列表）\n\n" + "\n".join(lines)
+        return content
     except Exception as e:
         print(f"[警告] DeepSeek 调用失败: {e}")
         lines = [f"- [{s}] {t}\n  {u}" for s, t, u in items]
@@ -217,7 +233,10 @@ def send_email(body):
         msg["Subject"] = Header(f"AI每日资讯 {datetime.now().strftime('%m-%d')}", "utf-8")
         msg["From"] = config.MAIL_USER
         msg["To"] = config.MAIL_TO
-        server = smtplib.SMTP_SSL(config.MAIL_SMTP_HOST, config.MAIL_SMTP_PORT, timeout=30)
+        # local_hostname="localhost"：跳过 socket.getfqdn() 反向DNS查询
+        # （部分网络环境下该查询会卡住数分钟，导致连接超时）
+        server = smtplib.SMTP_SSL(config.MAIL_SMTP_HOST, config.MAIL_SMTP_PORT,
+                                  local_hostname="localhost", timeout=30)
         server.login(config.MAIL_USER, config.MAIL_AUTH_CODE)
         server.sendmail(config.MAIL_USER, [config.MAIL_TO], msg.as_string())
         server.quit()
@@ -269,12 +288,39 @@ def run_once():
         print("[警告] 两个推送渠道都失败了，请检查 config.py")
 
 
+def is_peak_hour(now):
+    """判断当前是否处于 DeepSeek 高峰时段（8:00-12:00、14:00-18:00）"""
+    h = now.hour
+    return (8 <= h < 12) or (14 <= h < 18)
+
+
+def next_free_seconds(now):
+    """距下一个非高峰时刻的秒数（高峰结束后再执行，省钱）"""
+    if not is_peak_hour(now):
+        return 0
+    target_hour = 12 if now.hour < 12 else 18
+    target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+    return max((target - now).total_seconds() + 5, 0)
+
+
 def run_daemon():
-    """常驻模式：每天在配置的空闲时段运行（默认 7:30，避开 8-12/14-18 高峰）"""
+    """常驻模式：每天 12:30 自动运行；启动时如处于高峰则顺延到非高峰再跑"""
+    import threading
     from schedule import every, run_pending  # 延迟导入，不跑daemon就不需要schedule
-    hour, minute = 7, 30
+    hour, minute = 12, 30
+
+    now = datetime.now()
+    if is_peak_hour(now):
+        delay = next_free_seconds(now)
+        print(f"[信息] 当前为高峰时段（{now:%H:%M}），首次推送顺延至非高峰（{int(delay)}秒后）...")
+        threading.Timer(delay, run_once).start()
+    else:
+        # 非高峰时段：启动立即跑一次，防止"开机时间已过定时点"导致当天错过
+        print("[信息] 当前为非高峰时段，启动即执行一次...")
+        run_once()
+
     every().day.at(f"{hour:02d}:{minute:02d}").do(run_once)
-    print(f"[信息] 已启动常驻，每天 {hour:02d}:{minute:02d} 自动运行（可改 main.py 末尾）")
+    print(f"[信息] 已启动常驻，每天 {hour:02d}:{minute:02d} 自动运行（高峰时段不执行）")
     while True:
         run_pending()
         time.sleep(30)
